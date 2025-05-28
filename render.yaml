@@ -3,7 +3,7 @@ services:
     name: telegram-expulsion-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: gunicorn main:app -c gunicorn.conf.py
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -11,3 +11,5 @@ services:
         value: "5286685895"
       - key: TIME_LIMIT_SECONDS
         value: "120"
+      - key: WEBHOOK_URL
+        value: "https://bot1-4-yzqg.onrender.com"

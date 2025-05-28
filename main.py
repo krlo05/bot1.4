@@ -1,16 +1,15 @@
 import sqlite3
 import datetime
-import asyncio
 import os
-import threading
-import signal
-import sys
-from flask import Flask, jsonify, render_template_string
+import json
+from flask import Flask, request, jsonify, render_template_string
 from dotenv import load_dotenv
-from telegram import Update, ChatMember, Bot
-from telegram.ext import ApplicationBuilder, ChatMemberHandler, ContextTypes, CommandHandler
+from telegram import Update, Bot, ChatMember
+from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes
 import logging
-from werkzeug.serving import make_server
+import asyncio
+import threading
+from functools import wraps
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -23,9 +22,11 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("⚠️ BOT_TOKEN no está definido como variable de entorno")
+
 DB_NAME = 'members.db'
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "5286685895"))
 PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # URL de tu servicio en Render
 
 # 🌐 Crear aplicación Flask
 app = Flask(__name__)
@@ -33,11 +34,12 @@ app = Flask(__name__)
 # Variables globales
 telegram_app = None
 bot_status = {
-    "running": False, 
-    "last_check": None, 
+    "running": False,
+    "last_check": None,
     "members_count": 0,
     "admin_notified": False,
-    "errors": []
+    "errors": [],
+    "webhook_set": False
 }
 
 # 🧱 Inicializar DB
@@ -80,6 +82,23 @@ def get_stats():
         logger.error(f"Error obteniendo estadísticas: {e}")
         return {"total_members": 0, "groups": []}
 
+# 🔄 Función para ejecutar código async en thread separado
+def run_async(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        def run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(func(*args, **kwargs))
+            finally:
+                loop.close()
+        
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join()
+    return wrapper
+
 # 📥 Manejo de usuarios que se unen
 async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -119,13 +138,13 @@ async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAUL
 
 # 🧪 Comando de prueba
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot funcionando correctamente!")
+    await update.message.reply_text("✅ Bot funcionando correctamente con webhook!")
     logger.info(f"🧪 Comando /test ejecutado por {update.effective_user.id}")
 
 # 📊 Comando de estado
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = get_stats()
-    message = f"🤖 Bot funcionando\n👥 Usuarios registrados: {stats['total_members']}\n📱 Grupos: {len(stats['groups'])}"
+    message = f"🤖 Bot funcionando con webhook\n👥 Usuarios registrados: {stats['total_members']}\n📱 Grupos: {len(stats['groups'])}"
     await update.message.reply_text(message)
 
 # 🔔 Comando para que el admin se registre
@@ -136,101 +155,93 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ ¡Hola Admin! Ahora puedo enviarte notificaciones.")
         logger.info("✅ Admin registrado para notificaciones")
     else:
-        await update.message.reply_text("🤖 Bot de expulsión automática funcionando.")
+        await update.message.reply_text("🤖 Bot de expulsión automática funcionando con webhook.")
 
-# 🚫 Expulsión de usuarios luego de cierto tiempo
-async def check_old_members(app):
-    logger.info("🔄 Iniciando verificación periódica de miembros...")
-    while bot_status["running"]:
-        try:
-            now = datetime.datetime.now(datetime.timezone.utc)
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute('SELECT user_id, chat_id, join_date FROM members')
-            rows = cursor.fetchall()
-
-            logger.info(f"🔍 Verificando {len(rows)} miembros registrados...")
-            bot_status["last_check"] = now.isoformat()
-            bot_status["members_count"] = len(rows)
-
-            for user_id, chat_id, join_date in rows:
-                joined = datetime.datetime.fromisoformat(join_date)
-                seconds_in_group = (now - joined).total_seconds()
-                
-                time_limit = int(os.getenv("TIME_LIMIT_SECONDS", "120"))
-                
-                if seconds_in_group >= time_limit:
-                    try:
-                        await app.bot.ban_chat_member(chat_id, user_id)
-                        await app.bot.unban_chat_member(chat_id, user_id)
-                        logger.info(f"🧼 Usuario {user_id} expulsado del grupo {chat_id}")
-                        
-                        cursor.execute('DELETE FROM members WHERE user_id = ? AND chat_id = ?', (user_id, chat_id))
-                        conn.commit()
-                        
-                        # Intentar notificar al admin solo si está registrado
-                        if bot_status["admin_notified"]:
-                            try:
-                                await app.bot.send_message(
-                                    chat_id=ADMIN_CHAT_ID, 
-                                    text=f"🧼 Usuario {user_id} expulsado por tiempo límite ({time_limit}s)"
-                                )
-                            except Exception as e:
-                                logger.warning(f"No se pudo notificar al admin: {e}")
-                                
-                    except Exception as e:
-                        logger.error(f"⚠️ Error expulsando a {user_id}: {e}")
-                        bot_status["errors"].append(f"Error expulsando {user_id}: {str(e)}")
-            
-            conn.close()
-        except Exception as e:
-            logger.error(f"⚠️ Error en verificación de miembros: {e}")
-            bot_status["errors"].append(f"Error verificación: {str(e)}")
-        
-        await asyncio.sleep(30)
-
-# 🤖 Función principal del bot
-async def run_telegram_bot():
-    global telegram_app, bot_status
-    
+# 🚫 Función para expulsar usuarios viejos
+async def expel_old_user(user_id, chat_id, time_limit):
     try:
-        logger.info("🚀 Iniciando bot de Telegram...")
-        init_db()
-        
-        # Verificar conexión con Telegram
         bot = Bot(TOKEN)
+        await bot.ban_chat_member(chat_id, user_id)
+        await bot.unban_chat_member(chat_id, user_id)
+        logger.info(f"🧼 Usuario {user_id} expulsado del grupo {chat_id}")
+        
+        # Eliminar de la base de datos
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM members WHERE user_id = ? AND chat_id = ?', (user_id, chat_id))
+        conn.commit()
+        conn.close()
+        
+        # Notificar al admin si está registrado
+        if bot_status["admin_notified"]:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_CHAT_ID, 
+                    text=f"🧼 Usuario {user_id} expulsado por tiempo límite ({time_limit}s)"
+                )
+            except Exception as e:
+                logger.warning(f"No se pudo notificar al admin: {e}")
+                
+    except Exception as e:
+        logger.error(f"⚠️ Error expulsando a {user_id}: {e}")
+        bot_status["errors"].append(f"Error expulsando {user_id}: {str(e)}")
+
+# 🔄 Verificación periódica de miembros (ejecuta en background)
+@run_async
+async def check_old_members():
+    logger.info("🔍 Verificando miembros para expulsión...")
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, chat_id, join_date FROM members')
+        rows = cursor.fetchall()
+        conn.close()
+
+        logger.info(f"🔍 Verificando {len(rows)} miembros registrados...")
+        bot_status["last_check"] = now.isoformat()
+        bot_status["members_count"] = len(rows)
+
+        time_limit = int(os.getenv("TIME_LIMIT_SECONDS", "120"))
+        
+        for user_id, chat_id, join_date in rows:
+            joined = datetime.datetime.fromisoformat(join_date)
+            seconds_in_group = (now - joined).total_seconds()
+            
+            if seconds_in_group >= time_limit:
+                await expel_old_user(user_id, chat_id, time_limit)
+                
+    except Exception as e:
+        logger.error(f"⚠️ Error en verificación de miembros: {e}")
+        bot_status["errors"].append(f"Error verificación: {str(e)}")
+
+# 🌐 Configurar webhook
+@run_async
+async def setup_webhook():
+    try:
+        bot = Bot(TOKEN)
+        
+        # Obtener información del bot
         bot_info = await bot.get_me()
         logger.info(f"✅ Bot conectado: @{bot_info.username} (ID: {bot_info.id})")
         
-        telegram_app = ApplicationBuilder().token(TOKEN).build()
-        
-        # Añadir handlers
-        telegram_app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
-        telegram_app.add_handler(CommandHandler("test", test_command))
-        telegram_app.add_handler(CommandHandler("status", status_command))
-        telegram_app.add_handler(CommandHandler("start", start_command))
-        
+        # Configurar webhook si se proporciona URL
+        if WEBHOOK_URL:
+            webhook_url = f"{WEBHOOK_URL}/webhook/{TOKEN}"
+            await bot.set_webhook(url=webhook_url)
+            logger.info(f"✅ Webhook configurado: {webhook_url}")
+            bot_status["webhook_set"] = True
+        else:
+            logger.warning("⚠️ WEBHOOK_URL no configurada")
+            
         bot_status["running"] = True
         
-        # Ejecutar verificación en segundo plano
-        asyncio.create_task(check_old_members(telegram_app))
-        
-        logger.info("🤖 Bot de Telegram iniciado correctamente")
-        
-        # Iniciar polling
-        await telegram_app.run_polling(
-            allowed_updates=["chat_member", "message"],
-            drop_pending_updates=True,
-            poll_interval=1.0,
-            timeout=10
-        )
-        
     except Exception as e:
-        logger.error(f"Error en el bot de Telegram: {e}")
-        bot_status["running"] = False
-        bot_status["errors"].append(f"Error bot: {str(e)}")
+        logger.error(f"Error configurando webhook: {e}")
+        bot_status["errors"].append(f"Error webhook: {str(e)}")
 
 # 🌐 Rutas de Flask
+
 @app.route('/')
 def home():
     stats = get_stats()
@@ -238,7 +249,7 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Bot de Telegram - Estado</title>
+        <title>Bot de Telegram - Webhook</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -249,20 +260,26 @@ def home():
             .stopped { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
             .warning { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
             .stats { background: #e2e3e5; padding: 15px; border-radius: 5px; margin: 10px 0; }
-            .refresh { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
-            .refresh:hover { background: #0056b3; }
+            .button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; text-decoration: none; display: inline-block; }
+            .button:hover { background: #0056b3; }
+            .button.danger { background: #dc3545; }
+            .button.danger:hover { background: #c82333; }
         </style>
         <script>
             function refreshPage() { location.reload(); }
-            setInterval(refreshPage, 30000); // Auto-refresh cada 30 segundos
+            setInterval(refreshPage, 30000);
         </script>
     </head>
     <body>
         <div class="container">
-            <h1>🤖 Bot de Telegram - Panel de Control</h1>
+            <h1>🤖 Bot de Telegram - Webhook Mode</h1>
             
             <div class="status {{ 'running' if bot_running else 'stopped' }}">
-                <strong>Estado del Bot:</strong> {{ '🟢 Funcionando' if bot_running else '🔴 Detenido' }}
+                <strong>Estado del Bot:</strong> {{ '🟢 Funcionando con Webhook' if bot_running else '🔴 Detenido' }}
+            </div>
+            
+            <div class="status {{ 'running' if webhook_set else 'warning' }}">
+                <strong>Webhook:</strong> {{ '✅ Configurado' if webhook_set else '⚠️ No configurado' }}
             </div>
             
             {% if not admin_notified %}
@@ -280,6 +297,12 @@ def home():
                 <p><strong>📬 Admin notificado:</strong> {{ '✅ Sí' if admin_notified else '❌ No' }}</p>
             </div>
             
+            <div class="stats">
+                <h3>🔧 Acciones</h3>
+                <a href="/check_members" class="button">🔍 Verificar Miembros Ahora</a>
+                <a href="/setup_webhook" class="button">🔗 Reconfigurar Webhook</a>
+            </div>
+            
             {% if errors %}
             <div class="stats">
                 <h3>⚠️ Errores Recientes</h3>
@@ -290,7 +313,7 @@ def home():
             {% endif %}
             
             <div class="stats">
-                <h3>🔗 Endpoints disponibles</h3>
+                <h3>🔗 API Endpoints</h3>
                 <ul>
                     <li><a href="/status">/status</a> - Estado del bot (JSON)</li>
                     <li><a href="/stats">/stats</a> - Estadísticas (JSON)</li>
@@ -298,7 +321,7 @@ def home():
                 </ul>
             </div>
             
-            <button class="refresh" onclick="refreshPage()">🔄 Actualizar</button>
+            <button class="button" onclick="refreshPage()">🔄 Actualizar</button>
         </div>
     </body>
     </html>
@@ -306,6 +329,7 @@ def home():
     
     return render_template_string(html, 
         bot_running=bot_status["running"],
+        webhook_set=bot_status["webhook_set"],
         total_members=stats["total_members"],
         groups_count=len(stats["groups"]),
         last_check=bot_status["last_check"],
@@ -314,15 +338,89 @@ def home():
         errors=bot_status["errors"]
     )
 
+@app.route(f'/webhook/{TOKEN}', methods=['POST'])
+def webhook():
+    try:
+        # Recibir actualización de Telegram
+        json_data = request.get_json()
+        
+        if not json_data:
+            return "No data", 400
+            
+        logger.info(f"📨 Webhook recibido: {json_data}")
+        
+        # Crear objeto Update
+        update = Update.de_json(json_data, Bot(TOKEN))
+        
+        # Procesar la actualización
+        if update.chat_member:
+            # Ejecutar handler en thread separado
+            def process_update():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    # Crear contexto mock
+                    class MockContext:
+                        bot = Bot(TOKEN)
+                    
+                    context = MockContext()
+                    loop.run_until_complete(handle_chat_member_update(update, context))
+                finally:
+                    loop.close()
+            
+            thread = threading.Thread(target=process_update)
+            thread.start()
+            
+        elif update.message:
+            # Procesar comandos
+            def process_command():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    class MockContext:
+                        bot = Bot(TOKEN)
+                    
+                    context = MockContext()
+                    
+                    if update.message.text == "/start":
+                        loop.run_until_complete(start_command(update, context))
+                    elif update.message.text == "/test":
+                        loop.run_until_complete(test_command(update, context))
+                    elif update.message.text == "/status":
+                        loop.run_until_complete(status_command(update, context))
+                finally:
+                    loop.close()
+            
+            thread = threading.Thread(target=process_command)
+            thread.start()
+        
+        return "OK", 200
+        
+    except Exception as e:
+        logger.error(f"Error procesando webhook: {e}")
+        bot_status["errors"].append(f"Error webhook: {str(e)}")
+        return "Error", 500
+
+@app.route('/setup_webhook')
+def setup_webhook_route():
+    setup_webhook()
+    return jsonify({"message": "Webhook reconfigurado", "status": "ok"})
+
+@app.route('/check_members')
+def check_members_route():
+    check_old_members()
+    return jsonify({"message": "Verificación de miembros ejecutada", "status": "ok"})
+
 @app.route('/status')
 def status():
     return jsonify({
         "bot_running": bot_status["running"],
+        "webhook_set": bot_status["webhook_set"],
         "last_check": bot_status["last_check"],
         "members_count": bot_status["members_count"],
         "time_limit": int(os.getenv("TIME_LIMIT_SECONDS", "120")),
         "admin_notified": bot_status["admin_notified"],
-        "errors": bot_status["errors"][-10:]  # Últimos 10 errores
+        "errors": bot_status["errors"][-10:]
     })
 
 @app.route('/stats')
@@ -334,40 +432,20 @@ def health():
     return jsonify({
         "status": "ok", 
         "timestamp": datetime.datetime.now().isoformat(),
-        "bot_running": bot_status["running"]
+        "bot_running": bot_status["running"],
+        "webhook_set": bot_status["webhook_set"]
     })
 
-# 🚀 Función para ejecutar el bot en un hilo separado
-def start_telegram_bot():
-    def run_bot():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(run_telegram_bot())
-        except Exception as e:
-            logger.error(f"Error en hilo del bot: {e}")
-        finally:
-            loop.close()
-    
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    return bot_thread
-
-# 🌟 Punto de entrada principal
+# 🚀 Inicialización
 if __name__ == '__main__':
-    # Iniciar el bot de Telegram en un hilo separado
-    logger.info("🚀 Iniciando aplicación...")
-    start_telegram_bot()
+    logger.info("🚀 Iniciando aplicación con webhook...")
     
-    # Dar tiempo al bot para inicializarse
-    import time
-    time.sleep(2)
+    # Inicializar base de datos
+    init_db()
+    
+    # Configurar webhook
+    setup_webhook()
     
     # Iniciar Flask
     logger.info(f"🌐 Iniciando servidor Flask en puerto {PORT}")
-    
-    try:
-        app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
-    except KeyboardInterrupt:
-        logger.info("🛑 Aplicación detenida por el usuario")
-        bot_status["running"] = False
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
