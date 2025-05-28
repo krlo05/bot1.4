@@ -4,7 +4,7 @@ import os
 import json
 from flask import Flask, request, jsonify, render_template_string
 from dotenv import load_dotenv
-from telegram import Update, Bot, ChatMember
+from telegram import Update, Bot
 from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes
 import logging
 import asyncio
@@ -39,7 +39,8 @@ bot_status = {
     "members_count": 0,
     "admin_notified": False,
     "errors": [],
-    "webhook_set": False
+    "webhook_set": False,
+    "last_webhook_update": None
 }
 
 # 🧱 Inicializar DB
@@ -51,6 +52,7 @@ def init_db():
             user_id INTEGER,
             chat_id INTEGER,
             join_date TEXT,
+            username TEXT,
             PRIMARY KEY (user_id, chat_id)
         )
     ''')
@@ -72,15 +74,34 @@ def get_stats():
             GROUP BY chat_id
         ''')
         groups = cursor.fetchall()
+        
+        # Obtener lista de miembros recientes
+        cursor.execute('''
+            SELECT user_id, username, join_date, chat_id
+            FROM members 
+            ORDER BY join_date DESC 
+            LIMIT 10
+        ''')
+        recent_members = cursor.fetchall()
+        
         conn.close()
         
         return {
             "total_members": total_members,
-            "groups": [{"chat_id": chat_id, "members": count} for chat_id, count in groups]
+            "groups": [{"chat_id": chat_id, "members": count} for chat_id, count in groups],
+            "recent_members": [
+                {
+                    "user_id": user_id, 
+                    "username": username, 
+                    "join_date": join_date,
+                    "chat_id": chat_id
+                } 
+                for user_id, username, join_date, chat_id in recent_members
+            ]
         }
     except Exception as e:
         logger.error(f"Error obteniendo estadísticas: {e}")
-        return {"total_members": 0, "groups": []}
+        return {"total_members": 0, "groups": [], "recent_members": []}
 
 # 🔄 Función para ejecutar código async en thread separado
 def run_async(func):
@@ -108,29 +129,54 @@ async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAUL
         
         logger.info(f"👤 Usuario {member_update.new_chat_member.user.id}: {old_status} -> {new_status}")
         
-        # Usuario se une al grupo
-        if (old_status in [ChatMember.LEFT, ChatMember.KICKED, "unknown"] and 
-            new_status == ChatMember.MEMBER):
+        # Usuario se une al grupo (usando strings en lugar de constantes)
+        if (old_status in ["left", "kicked", "unknown"] and new_status == "member"):
             
             user = member_update.new_chat_member.user
             user_id = user.id
             username = user.username or f"id:{user_id}"
+            first_name = user.first_name or "Sin nombre"
             chat_id = member_update.chat.id
             join_date = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT OR REPLACE INTO members (user_id, chat_id, join_date)
-                VALUES (?, ?, ?)
-            ''', (user_id, chat_id, join_date))
+                INSERT OR REPLACE INTO members (user_id, chat_id, join_date, username)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, chat_id, join_date, username))
             conn.commit()
             conn.close()
 
-            logger.info(f"📥 Usuario nuevo: @{username} agregado el {join_date}")
+            logger.info(f"📥 Usuario nuevo: @{username} ({first_name}) agregado el {join_date}")
             
             # Actualizar estadísticas
             bot_status["members_count"] = get_stats()["total_members"]
+            
+            # Notificar al admin si está registrado
+            if bot_status["admin_notified"]:
+                try:
+                    bot = Bot(TOKEN)
+                    await bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=f"📥 Nuevo miembro: @{username} ({first_name})\nChat: {chat_id}\nFecha: {join_date}"
+                    )
+                except Exception as e:
+                    logger.warning(f"No se pudo notificar nuevo miembro: {e}")
+            
+        # Usuario sale del grupo
+        elif (old_status == "member" and new_status in ["left", "kicked"]):
+            user_id = member_update.new_chat_member.user.id
+            chat_id = member_update.chat.id
+            
+            # Eliminar de la base de datos
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM members WHERE user_id = ? AND chat_id = ?', (user_id, chat_id))
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"👋 Usuario {user_id} salió del grupo {chat_id}")
             
     except Exception as e:
         logger.error(f"Error en handle_chat_member_update: {e}")
@@ -138,13 +184,21 @@ async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAUL
 
 # 🧪 Comando de prueba
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot funcionando correctamente con webhook!")
+    stats = get_stats()
+    message = f"✅ Bot funcionando correctamente con webhook!\n👥 Usuarios registrados: {stats['total_members']}"
+    await update.message.reply_text(message)
     logger.info(f"🧪 Comando /test ejecutado por {update.effective_user.id}")
 
 # 📊 Comando de estado
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = get_stats()
     message = f"🤖 Bot funcionando con webhook\n👥 Usuarios registrados: {stats['total_members']}\n📱 Grupos: {len(stats['groups'])}"
+    
+    if stats['recent_members']:
+        message += "\n\n📋 Últimos miembros:"
+        for member in stats['recent_members'][:5]:
+            message += f"\n• @{member['username']} - {member['join_date'][:16]}"
+    
     await update.message.reply_text(message)
 
 # 🔔 Comando para que el admin se registre
@@ -158,12 +212,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🤖 Bot de expulsión automática funcionando con webhook.")
 
 # 🚫 Función para expulsar usuarios viejos
-async def expel_old_user(user_id, chat_id, time_limit):
+async def expel_old_user(user_id, chat_id, time_limit, username):
     try:
         bot = Bot(TOKEN)
+        
+        # Verificar permisos del bot
+        try:
+            chat_member = await bot.get_chat_member(chat_id, bot.id)
+            if not chat_member.can_restrict_members:
+                logger.warning(f"⚠️ Bot no tiene permisos para expulsar en chat {chat_id}")
+                return False
+        except Exception as e:
+            logger.warning(f"No se pudo verificar permisos: {e}")
+        
+        # Expulsar usuario
         await bot.ban_chat_member(chat_id, user_id)
         await bot.unban_chat_member(chat_id, user_id)
-        logger.info(f"🧼 Usuario {user_id} expulsado del grupo {chat_id}")
+        logger.info(f"🧼 Usuario {user_id} (@{username}) expulsado del grupo {chat_id}")
         
         # Eliminar de la base de datos
         conn = sqlite3.connect(DB_NAME)
@@ -177,14 +242,17 @@ async def expel_old_user(user_id, chat_id, time_limit):
             try:
                 await bot.send_message(
                     chat_id=ADMIN_CHAT_ID, 
-                    text=f"🧼 Usuario {user_id} expulsado por tiempo límite ({time_limit}s)"
+                    text=f"🧼 Usuario expulsado por tiempo límite\n👤 @{username} (ID: {user_id})\n⏱️ Tiempo límite: {time_limit}s\n📱 Chat: {chat_id}"
                 )
             except Exception as e:
                 logger.warning(f"No se pudo notificar al admin: {e}")
+        
+        return True
                 
     except Exception as e:
         logger.error(f"⚠️ Error expulsando a {user_id}: {e}")
         bot_status["errors"].append(f"Error expulsando {user_id}: {str(e)}")
+        return False
 
 # 🔄 Verificación periódica de miembros (ejecuta en background)
 @run_async
@@ -194,7 +262,7 @@ async def check_old_members():
         now = datetime.datetime.now(datetime.timezone.utc)
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute('SELECT user_id, chat_id, join_date FROM members')
+        cursor.execute('SELECT user_id, chat_id, join_date, username FROM members')
         rows = cursor.fetchall()
         conn.close()
 
@@ -203,13 +271,21 @@ async def check_old_members():
         bot_status["members_count"] = len(rows)
 
         time_limit = int(os.getenv("TIME_LIMIT_SECONDS", "120"))
+        expelled_count = 0
         
-        for user_id, chat_id, join_date in rows:
+        for user_id, chat_id, join_date, username in rows:
             joined = datetime.datetime.fromisoformat(join_date)
             seconds_in_group = (now - joined).total_seconds()
             
+            logger.info(f"⏳ Usuario {user_id} (@{username}) lleva {seconds_in_group:.1f}s en el grupo")
+            
             if seconds_in_group >= time_limit:
-                await expel_old_user(user_id, chat_id, time_limit)
+                success = await expel_old_user(user_id, chat_id, time_limit, username)
+                if success:
+                    expelled_count += 1
+        
+        if expelled_count > 0:
+            logger.info(f"🧼 Total de usuarios expulsados: {expelled_count}")
                 
     except Exception as e:
         logger.error(f"⚠️ Error en verificación de miembros: {e}")
@@ -254,7 +330,7 @@ def home():
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-            .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 800px; margin: 0 auto; }
+            .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 900px; margin: 0 auto; }
             .status { padding: 15px; border-radius: 5px; margin: 10px 0; }
             .running { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
             .stopped { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
@@ -264,6 +340,8 @@ def home():
             .button:hover { background: #0056b3; }
             .button.danger { background: #dc3545; }
             .button.danger:hover { background: #c82333; }
+            .members-list { max-height: 200px; overflow-y: auto; background: #f8f9fa; padding: 10px; border-radius: 5px; }
+            .member-item { padding: 5px; border-bottom: 1px solid #dee2e6; }
         </style>
         <script>
             function refreshPage() { location.reload(); }
@@ -293,9 +371,23 @@ def home():
                 <p><strong>👥 Total de usuarios:</strong> {{ total_members }}</p>
                 <p><strong>📱 Grupos activos:</strong> {{ groups_count }}</p>
                 <p><strong>🕐 Última verificación:</strong> {{ last_check or 'Nunca' }}</p>
+                <p><strong>📨 Última actualización webhook:</strong> {{ last_webhook_update or 'Nunca' }}</p>
                 <p><strong>⏱️ Tiempo límite:</strong> {{ time_limit }} segundos</p>
                 <p><strong>📬 Admin notificado:</strong> {{ '✅ Sí' if admin_notified else '❌ No' }}</p>
             </div>
+            
+            {% if recent_members %}
+            <div class="stats">
+                <h3>👥 Miembros Recientes</h3>
+                <div class="members-list">
+                    {% for member in recent_members %}
+                    <div class="member-item">
+                        <strong>@{{ member.username }}</strong> - {{ member.join_date[:16] }} - Chat: {{ member.chat_id }}
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
             
             <div class="stats">
                 <h3>🔧 Acciones</h3>
@@ -332,7 +424,9 @@ def home():
         webhook_set=bot_status["webhook_set"],
         total_members=stats["total_members"],
         groups_count=len(stats["groups"]),
+        recent_members=stats["recent_members"],
         last_check=bot_status["last_check"],
+        last_webhook_update=bot_status["last_webhook_update"],
         time_limit=os.getenv("TIME_LIMIT_SECONDS", "120"),
         admin_notified=bot_status["admin_notified"],
         errors=bot_status["errors"]
@@ -348,6 +442,7 @@ def webhook():
             return "No data", 400
             
         logger.info(f"📨 Webhook recibido: {json_data}")
+        bot_status["last_webhook_update"] = datetime.datetime.now().isoformat()
         
         # Crear objeto Update
         update = Update.de_json(json_data, Bot(TOKEN))
@@ -417,6 +512,7 @@ def status():
         "bot_running": bot_status["running"],
         "webhook_set": bot_status["webhook_set"],
         "last_check": bot_status["last_check"],
+        "last_webhook_update": bot_status["last_webhook_update"],
         "members_count": bot_status["members_count"],
         "time_limit": int(os.getenv("TIME_LIMIT_SECONDS", "120")),
         "admin_notified": bot_status["admin_notified"],
