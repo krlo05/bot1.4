@@ -26,7 +26,7 @@ if not TOKEN:
 DB_NAME = 'members.db'
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "5286685895"))
 PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # URL de tu servicio en Render
+WEBHOOK_URL = os.getenv("https://bot1-4-yzqg.onrender.com", "")  # URL de tu servicio en Render
 
 # 🌐 Crear aplicación Flask
 app = Flask(__name__)
