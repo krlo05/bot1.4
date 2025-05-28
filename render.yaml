@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: telegram-expulsion-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        value: "5286685895"
+      - key: TIME_LIMIT_SECONDS
+        value: "120"
