@@ -3,12 +3,14 @@ import datetime
 import asyncio
 import os
 import threading
+import signal
+import sys
 from flask import Flask, jsonify, render_template_string
 from dotenv import load_dotenv
 from telegram import Update, ChatMember, Bot
 from telegram.ext import ApplicationBuilder, ChatMemberHandler, ContextTypes, CommandHandler
-import nest_asyncio
 import logging
+from werkzeug.serving import make_server
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -28,9 +30,15 @@ PORT = int(os.getenv("PORT", "10000"))
 # 🌐 Crear aplicación Flask
 app = Flask(__name__)
 
-# Variable global para el bot
+# Variables globales
 telegram_app = None
-bot_status = {"running": False, "last_check": None, "members_count": 0}
+bot_status = {
+    "running": False, 
+    "last_check": None, 
+    "members_count": 0,
+    "admin_notified": False,
+    "errors": []
+}
 
 # 🧱 Inicializar DB
 def init_db():
@@ -107,6 +115,7 @@ async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAUL
             
     except Exception as e:
         logger.error(f"Error en handle_chat_member_update: {e}")
+        bot_status["errors"].append(f"Error manejando usuario: {str(e)}")
 
 # 🧪 Comando de prueba
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,10 +128,20 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = f"🤖 Bot funcionando\n👥 Usuarios registrados: {stats['total_members']}\n📱 Grupos: {len(stats['groups'])}"
     await update.message.reply_text(message)
 
+# 🔔 Comando para que el admin se registre
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id == ADMIN_CHAT_ID:
+        bot_status["admin_notified"] = True
+        await update.message.reply_text("✅ ¡Hola Admin! Ahora puedo enviarte notificaciones.")
+        logger.info("✅ Admin registrado para notificaciones")
+    else:
+        await update.message.reply_text("🤖 Bot de expulsión automática funcionando.")
+
 # 🚫 Expulsión de usuarios luego de cierto tiempo
 async def check_old_members(app):
     logger.info("🔄 Iniciando verificación periódica de miembros...")
-    while True:
+    while bot_status["running"]:
         try:
             now = datetime.datetime.now(datetime.timezone.utc)
             conn = sqlite3.connect(DB_NAME)
@@ -149,21 +168,24 @@ async def check_old_members(app):
                         cursor.execute('DELETE FROM members WHERE user_id = ? AND chat_id = ?', (user_id, chat_id))
                         conn.commit()
                         
-                        # Notificar al admin
-                        try:
-                            await app.bot.send_message(
-                                chat_id=ADMIN_CHAT_ID, 
-                                text=f"🧼 Usuario {user_id} expulsado por tiempo límite ({time_limit}s)"
-                            )
-                        except Exception as e:
-                            logger.error(f"Error enviando notificación: {e}")
-                            
+                        # Intentar notificar al admin solo si está registrado
+                        if bot_status["admin_notified"]:
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=ADMIN_CHAT_ID, 
+                                    text=f"🧼 Usuario {user_id} expulsado por tiempo límite ({time_limit}s)"
+                                )
+                            except Exception as e:
+                                logger.warning(f"No se pudo notificar al admin: {e}")
+                                
                     except Exception as e:
                         logger.error(f"⚠️ Error expulsando a {user_id}: {e}")
+                        bot_status["errors"].append(f"Error expulsando {user_id}: {str(e)}")
             
             conn.close()
         except Exception as e:
             logger.error(f"⚠️ Error en verificación de miembros: {e}")
+            bot_status["errors"].append(f"Error verificación: {str(e)}")
         
         await asyncio.sleep(30)
 
@@ -186,30 +208,27 @@ async def run_telegram_bot():
         telegram_app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
         telegram_app.add_handler(CommandHandler("test", test_command))
         telegram_app.add_handler(CommandHandler("status", status_command))
+        telegram_app.add_handler(CommandHandler("start", start_command))
+        
+        bot_status["running"] = True
         
         # Ejecutar verificación en segundo plano
         asyncio.create_task(check_old_members(telegram_app))
         
-        bot_status["running"] = True
-        
-        # Enviar mensaje de inicio
-        try:
-            await telegram_app.bot.send_message(
-                chat_id=ADMIN_CHAT_ID, 
-                text="🤖 Bot iniciado correctamente ✅"
-            )
-        except Exception as e:
-            logger.error(f"No se pudo enviar mensaje al admin: {e}")
+        logger.info("🤖 Bot de Telegram iniciado correctamente")
         
         # Iniciar polling
         await telegram_app.run_polling(
             allowed_updates=["chat_member", "message"],
-            drop_pending_updates=True
+            drop_pending_updates=True,
+            poll_interval=1.0,
+            timeout=10
         )
         
     except Exception as e:
         logger.error(f"Error en el bot de Telegram: {e}")
         bot_status["running"] = False
+        bot_status["errors"].append(f"Error bot: {str(e)}")
 
 # 🌐 Rutas de Flask
 @app.route('/')
@@ -221,14 +240,22 @@ def home():
     <head>
         <title>Bot de Telegram - Estado</title>
         <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
-            .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+            .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 800px; margin: 0 auto; }
             .status { padding: 15px; border-radius: 5px; margin: 10px 0; }
             .running { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
             .stopped { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+            .warning { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
             .stats { background: #e2e3e5; padding: 15px; border-radius: 5px; margin: 10px 0; }
+            .refresh { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+            .refresh:hover { background: #0056b3; }
         </style>
+        <script>
+            function refreshPage() { location.reload(); }
+            setInterval(refreshPage, 30000); // Auto-refresh cada 30 segundos
+        </script>
     </head>
     <body>
         <div class="container">
@@ -238,13 +265,29 @@ def home():
                 <strong>Estado del Bot:</strong> {{ '🟢 Funcionando' if bot_running else '🔴 Detenido' }}
             </div>
             
+            {% if not admin_notified %}
+            <div class="status warning">
+                <strong>⚠️ Acción Requerida:</strong> Envía <code>/start</code> al bot en Telegram para recibir notificaciones.
+            </div>
+            {% endif %}
+            
             <div class="stats">
                 <h3>📊 Estadísticas</h3>
                 <p><strong>👥 Total de usuarios:</strong> {{ total_members }}</p>
                 <p><strong>📱 Grupos activos:</strong> {{ groups_count }}</p>
                 <p><strong>🕐 Última verificación:</strong> {{ last_check or 'Nunca' }}</p>
                 <p><strong>⏱️ Tiempo límite:</strong> {{ time_limit }} segundos</p>
+                <p><strong>📬 Admin notificado:</strong> {{ '✅ Sí' if admin_notified else '❌ No' }}</p>
             </div>
+            
+            {% if errors %}
+            <div class="stats">
+                <h3>⚠️ Errores Recientes</h3>
+                {% for error in errors[-5:] %}
+                <p style="color: #721c24;">• {{ error }}</p>
+                {% endfor %}
+            </div>
+            {% endif %}
             
             <div class="stats">
                 <h3>🔗 Endpoints disponibles</h3>
@@ -254,6 +297,8 @@ def home():
                     <li><a href="/health">/health</a> - Health check</li>
                 </ul>
             </div>
+            
+            <button class="refresh" onclick="refreshPage()">🔄 Actualizar</button>
         </div>
     </body>
     </html>
@@ -264,7 +309,9 @@ def home():
         total_members=stats["total_members"],
         groups_count=len(stats["groups"]),
         last_check=bot_status["last_check"],
-        time_limit=os.getenv("TIME_LIMIT_SECONDS", "120")
+        time_limit=os.getenv("TIME_LIMIT_SECONDS", "120"),
+        admin_notified=bot_status["admin_notified"],
+        errors=bot_status["errors"]
     )
 
 @app.route('/status')
@@ -273,7 +320,9 @@ def status():
         "bot_running": bot_status["running"],
         "last_check": bot_status["last_check"],
         "members_count": bot_status["members_count"],
-        "time_limit": int(os.getenv("TIME_LIMIT_SECONDS", "120"))
+        "time_limit": int(os.getenv("TIME_LIMIT_SECONDS", "120")),
+        "admin_notified": bot_status["admin_notified"],
+        "errors": bot_status["errors"][-10:]  # Últimos 10 errores
     })
 
 @app.route('/stats')
@@ -282,21 +331,43 @@ def stats():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "timestamp": datetime.datetime.now().isoformat()})
+    return jsonify({
+        "status": "ok", 
+        "timestamp": datetime.datetime.now().isoformat(),
+        "bot_running": bot_status["running"]
+    })
 
 # 🚀 Función para ejecutar el bot en un hilo separado
 def start_telegram_bot():
-    nest_asyncio.apply()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_telegram_bot())
+    def run_bot():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_telegram_bot())
+        except Exception as e:
+            logger.error(f"Error en hilo del bot: {e}")
+        finally:
+            loop.close()
+    
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    return bot_thread
 
 # 🌟 Punto de entrada principal
 if __name__ == '__main__':
     # Iniciar el bot de Telegram en un hilo separado
-    bot_thread = threading.Thread(target=start_telegram_bot, daemon=True)
-    bot_thread.start()
+    logger.info("🚀 Iniciando aplicación...")
+    start_telegram_bot()
+    
+    # Dar tiempo al bot para inicializarse
+    import time
+    time.sleep(2)
     
     # Iniciar Flask
     logger.info(f"🌐 Iniciando servidor Flask en puerto {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    
+    try:
+        app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        logger.info("🛑 Aplicación detenida por el usuario")
+        bot_status["running"] = False
