@@ -11,5 +11,7 @@ services:
         value: "5286685895"
       - key: TIME_LIMIT_SECONDS
         value: "120"
+      - key: CHECK_INTERVAL_SECONDS
+        value: "120"
       - key: WEBHOOK_URL
         value: "https://bot1-4-yzqg.onrender.com"
